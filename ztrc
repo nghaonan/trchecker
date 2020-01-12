@@ -297,8 +297,9 @@ FORM f_build_top CHANGING ch_list_commentary TYPE slis_t_listheader.
 
 *Warning TR:
   CLEAR: ls_line, lt_tr_detail.
-  DELETE lt_tr_detail WHERE tr_rc <> 8 AND
-                            tr_rc <> 0.
+  lt_tr_detail = gt_tr_detail.
+  DELETE lt_tr_detail WHERE tr_rc = 8 AND
+                            tr_rc = 0.
   DESCRIBE TABLE lt_tr_detail LINES lv_tr_warn_num.
   ls_line-key = 'Warning TR:'.
   ls_line-info = lv_tr_warn_num.
@@ -629,13 +630,13 @@ ENDFORM.
 *& Register event for ALV Tree
 *----------------------------------------------------------------------*
 FORM f_register_events.
-*§4. Event registration: tell ALV Tree which events shall be passed
+*ï¿½4. Event registration: tell ALV Tree which events shall be passed
 *    from frontend to backend.
   DATA: lt_events        TYPE cntl_simple_events,
         l_event          TYPE cntl_simple_event,
         l_event_receiver TYPE REF TO lcl_tree_event_receiver.
 
-*§4a. Frontend registration(i):  get already registered tree events.
+*ï¿½4a. Frontend registration(i):  get already registered tree events.
 *................................................................
 * The following four tree events registers ALV Tree in the constructor
 * method itself.
@@ -658,7 +659,7 @@ FORM f_register_events.
   APPEND l_event TO lt_events.
   l_event-eventid = cl_gui_column_tree=>eventid_item_double_click.
   APPEND l_event TO lt_events.
-*§4c. Frontend registration(iii):provide new event table to alv tree
+*ï¿½4c. Frontend registration(iii):provide new event table to alv tree
   go_alv_tree->set_registered_events( EXPORTING  events                    = lt_events
                                       EXCEPTIONS cntl_error                = 1
                                                  cntl_system_error         = 2
@@ -667,7 +668,7 @@ FORM f_register_events.
     MESSAGE x208(00) WITH 'ERROR'.                          "#EC NOTEXT
   ENDIF.
 *--------------------
-*§4d. Register events on backend (ABAP Objects event handling)
+*ï¿½4d. Register events on backend (ABAP Objects event handling)
   CREATE OBJECT l_event_receiver.
   SET HANDLER l_event_receiver->handle_node_double_click FOR go_alv_tree.
   SET HANDLER l_event_receiver->handle_item_double_click FOR go_alv_tree.
