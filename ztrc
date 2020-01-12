@@ -1,0 +1,708 @@
+*&---------------------------------------------------------------------*
+*& Report ZTRC
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT ztrc.
+*Data declaration
+TABLES: e070.
+TYPE-POOLS: icon.
+TYPES: BEGIN OF gty_tr_detail,
+         trkorr  TYPE trkorr,
+         trdesc  TYPE as4text,
+         tr_rc   TYPE int4,
+         systems TYPE  ctslg_systems,
+       END OF gty_tr_detail,
+       BEGIN OF gty_tree_output,
+         trkorr      TYPE trkorr,
+         trdesc      TYPE as4text,
+         systemid    TYPE trtarsys,
+         clientid    TYPE mandt,
+         stepdesc    TYPE ddtext,
+         import_rc   TYPE int4,
+         import_date TYPE datum,
+         import_time TYPE uzeit,
+       END OF gty_tree_output,
+       gtt_tree_output TYPE STANDARD TABLE OF gty_tree_output.
+
+DATA: gt_tr_detail   TYPE STANDARD TABLE OF gty_tr_detail,
+      gt_tree_output TYPE STANDARD TABLE OF gty_tree_output.
+DATA: go_alv_tree         TYPE REF TO cl_gui_alv_tree,
+      go_custom_container TYPE REF TO cl_gui_custom_container,
+      gt_fieldcatalog     TYPE lvc_t_fcat.
+
+*Selection Screen
+SELECT-OPTIONS: s_tr FOR e070-trkorr NO INTERVALS.
+
+*Class
+CLASS lcl_tree_event_receiver DEFINITION.
+
+  PUBLIC SECTION.
+    METHODS handle_node_double_click
+      FOR EVENT node_double_click OF cl_gui_alv_tree
+      IMPORTING node_key sender.
+* 'sender' is an implicit event parameter that is provided by
+* ABAP Objects runtime system. It contains a reference to the
+* object that fired the event. You may directly use it to
+* call methods of this instance.
+    METHODS handle_item_double_click
+      FOR EVENT item_double_click OF cl_gui_alv_tree
+      IMPORTING fieldname node_key.
+ENDCLASS.
+
+CLASS lcl_tree_event_receiver IMPLEMENTATION.
+  METHOD handle_node_double_click.
+    DATA: lt_children TYPE lvc_t_nkey.
+*First check if the node is a leaf, i.e. can not be expanded
+    sender->get_children( EXPORTING i_node_key  = node_key
+                          IMPORTING et_children = lt_children ).
+    IF NOT lt_children IS INITIAL.
+      sender->expand_node( i_node_key    = node_key
+                           i_level_count = 2 ). "2 level only
+    ENDIF.
+  ENDMETHOD.
+  METHOD handle_item_double_click.
+    DATA: ls_tree_output TYPE gty_tree_output,
+          lv_index       TYPE syst_index.
+
+    IF fieldname IS NOT INITIAL AND
+       node_key IS NOT INITIAL.
+      lv_index = node_key.
+      READ TABLE gt_tree_output INTO ls_tree_output INDEX lv_index.
+      IF sy-subrc = 0 AND
+         ls_tree_output-trkorr IS NOT INITIAL.
+        CALL FUNCTION 'TR_LOG_OVERVIEW_REQUEST_REMOTE'
+          EXPORTING
+            iv_trkorr = ls_tree_output-trkorr
+          EXCEPTIONS
+            OTHERS    = 1.
+        IF sy-subrc <> 0.
+          MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+                  WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+START-OF-SELECTION.
+*Get a list of tr
+  PERFORM f_get_tr_list.
+  IF gt_tr_detail IS INITIAL.
+    MESSAGE 'No Transport Request found.' TYPE 'E'.
+    RETURN.
+  ENDIF.
+*Get tr details
+  PERFORM f_get_tr_detail.
+*Call screen
+  CALL SCREEN 100.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_TR_LIST
+*&---------------------------------------------------------------------*
+*& Get a TR list
+*----------------------------------------------------------------------*
+FORM f_get_tr_list.
+  TYPES: BEGIN OF lty_tr,
+           trkorr  TYPE trkorr,
+           as4text TYPE as4text,
+         END OF lty_tr.
+
+  DATA: lt_tr_list   TYPE STANDARD TABLE OF lty_tr,
+        ls_tr_list   TYPE lty_tr,
+        ls_tr_detail TYPE gty_tr_detail.
+  SELECT e070~trkorr
+         e07t~as4text
+  FROM e070 AS e070
+  INNER JOIN e07t AS e07t
+  ON e070~trkorr = e07t~trkorr
+  INTO TABLE lt_tr_list
+  WHERE e070~trkorr IN s_tr.
+  IF sy-subrc = 0.
+    LOOP AT lt_tr_list INTO ls_tr_list.
+      ls_tr_detail-trkorr = ls_tr_list-trkorr.
+      ls_tr_detail-trdesc = ls_tr_list-as4text.
+      APPEND ls_tr_detail TO gt_tr_detail.
+      CLEAR: ls_tr_detail.
+    ENDLOOP.
+  ENDIF.
+  SORT gt_tr_detail BY trkorr.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_TR_DETAIL
+*&---------------------------------------------------------------------*
+*& Get a TR detail
+*----------------------------------------------------------------------*
+FORM f_get_tr_detail.
+  DATA: ls_settings TYPE  ctslg_settings,
+        ls_cofile   TYPE ctslg_cofile,
+        ls_system   TYPE ctslg_system.
+  FIELD-SYMBOLS: <lfs_tr_detail> TYPE gty_tr_detail.
+
+  LOOP AT gt_tr_detail ASSIGNING <lfs_tr_detail>.
+
+    ls_settings-detailed_depiction = 'X'.
+    CALL FUNCTION 'TR_READ_GLOBAL_INFO_OF_REQUEST'
+      EXPORTING
+        iv_trkorr   = <lfs_tr_detail>-trkorr
+        is_settings = ls_settings
+      IMPORTING
+        es_cofile   = ls_cofile.
+
+    IF ls_cofile IS NOT INITIAL.
+      IF ls_cofile-systems IS NOT INITIAL.
+        <lfs_tr_detail>-systems = ls_cofile-systems.
+        SORT ls_cofile-systems BY rc DESCENDING.
+*Determine if this TR has any error or warning
+        READ TABLE ls_cofile-systems INTO ls_system INDEX 1.
+        IF sy-subrc = 0.
+          <lfs_tr_detail>-tr_rc = ls_system-rc.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_INIT_TREE
+*&---------------------------------------------------------------------*
+*& Initialize ALV tree
+*----------------------------------------------------------------------*
+FORM f_init_tree.
+*Create container for alv-tree
+  DATA: lv_tree_container_name(30) TYPE c,
+        ls_hierarchy_header        TYPE treev_hhdr,
+        lt_list_commentary         TYPE slis_t_listheader.
+
+  lv_tree_container_name = 'CCONTAINER1'.
+
+  CREATE OBJECT go_custom_container
+    EXPORTING
+      container_name              = lv_tree_container_name
+    EXCEPTIONS
+      cntl_error                  = 1
+      cntl_system_error           = 2
+      create_error                = 3
+      lifetime_error              = 4
+      lifetime_dynpro_dynpro_link = 5.
+  IF sy-subrc <> 0.
+    MESSAGE x208(00) WITH 'ERROR'(100).
+  ENDIF.
+
+*Create tree control
+  CREATE OBJECT go_alv_tree
+    EXPORTING
+      parent                      = go_custom_container
+      node_selection_mode         = cl_gui_column_tree=>node_sel_mode_single
+      item_selection              = 'X'
+      no_toolbar                  = ''
+    EXCEPTIONS
+      cntl_error                  = 1
+      cntl_system_error           = 2
+      create_error                = 3
+      lifetime_error              = 4
+      illegal_node_selection_mode = 5
+      failed                      = 6
+      illegal_column_name         = 7.
+  IF sy-subrc <> 0.
+    MESSAGE x208(00) WITH 'ERROR'.                          "#EC NOTEXT
+  ENDIF.
+
+  PERFORM f_build_hierarchy_header CHANGING ls_hierarchy_header.
+
+*Column settings
+  PERFORM f_build_fieldcatalog.
+
+*Build Top of page
+  PERFORM f_build_top CHANGING lt_list_commentary.
+*IMPORTANT: Table 'gt_tree_output' must be empty. Do not change this table
+*(even after this method call). You can change data of your table
+*by calling methods of CL_GUI_ALV_TREE.
+*Furthermore, the output table 'gt_outtab' must be global and can
+*only be used for one ALV Tree Control.
+  go_alv_tree->set_table_for_first_display( EXPORTING is_hierarchy_header = ls_hierarchy_header
+                                                      it_list_commentary  = lt_list_commentary
+                                            CHANGING  it_fieldcatalog     = gt_fieldcatalog
+                                                      it_outtab           = gt_tree_output ). "table must be empty!
+  PERFORM f_create_hierarchy.
+
+  PERFORM f_register_events.
+
+*Send data to frontend.
+  go_alv_tree->frontend_update( ).
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_HIERARCHY_HEADER
+*&---------------------------------------------------------------------*
+*& Build ALV Tree hierarchy header
+*----------------------------------------------------------------------*
+FORM f_build_hierarchy_header CHANGING ch_hierarchy_header TYPE treev_hhdr.
+
+  ch_hierarchy_header-heading = 'TR Num-Description'.
+  ch_hierarchy_header-tooltip = 'Transport Request Number-Description'.
+  ch_hierarchy_header-width = 81.
+  ch_hierarchy_header-width_pix = ''.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_HIERARCHY_HEADER
+*&---------------------------------------------------------------------*
+*& Build ALV Tree Top of page
+*----------------------------------------------------------------------*
+FORM f_build_top CHANGING ch_list_commentary TYPE slis_t_listheader.
+  DATA: ls_line         TYPE slis_listheader,
+        lv_date         TYPE datum,
+        lv_time         TYPE uzeit,
+        lv_datetime     TYPE char20,
+        lv_tr_tot_num   TYPE i,
+        lv_tr_error_num TYPE i,
+        lv_tr_warn_num  TYPE i,
+        lt_tr_detail    TYPE STANDARD TABLE OF gty_tr_detail.
+  lt_tr_detail = gt_tr_detail.
+*User:
+  ls_line-key = 'User:'.
+  ls_line-info = sy-uname.
+  ls_line-typ  = 'S'.
+  APPEND ls_line TO ch_list_commentary.
+
+*Date Time:
+  CLEAR: ls_line.
+  PERFORM f_get_curr_time CHANGING lv_date lv_time.
+  PERFORM f_convert_date_to_external USING lv_date CHANGING lv_datetime(10).
+  PERFORM f_convert_time_to_external USING lv_time CHANGING lv_datetime+11(5).
+  ls_line-key = 'Date Time:'.
+  ls_line-info = lv_datetime.
+  ls_line-typ  = 'S'.
+  APPEND ls_line TO ch_list_commentary.
+
+*Number of TR:
+  CLEAR: ls_line.
+  DESCRIBE TABLE lt_tr_detail LINES lv_tr_tot_num.
+  ls_line-key = 'Total Number of TR:'.
+  ls_line-info = lv_tr_tot_num.
+  ls_line-typ  = 'S'.
+  APPEND ls_line TO ch_list_commentary.
+
+*Error TR:
+  CLEAR: ls_line.
+  DELETE lt_tr_detail WHERE tr_rc <> 8.
+  DESCRIBE TABLE lt_tr_detail LINES lv_tr_error_num.
+  ls_line-key = 'Error TR:'.
+  ls_line-info = lv_tr_error_num.
+  ls_line-typ  = 'S'.
+  APPEND ls_line TO ch_list_commentary.
+
+*Warning TR:
+  CLEAR: ls_line, lt_tr_detail.
+  DELETE lt_tr_detail WHERE tr_rc <> 8 AND
+                            tr_rc <> 0.
+  DESCRIBE TABLE lt_tr_detail LINES lv_tr_warn_num.
+  ls_line-key = 'Warning TR:'.
+  ls_line-info = lv_tr_warn_num.
+  ls_line-typ  = 'S'.
+  APPEND ls_line TO ch_list_commentary.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_CREATE_HIERARCHY
+*&---------------------------------------------------------------------*
+*& Create ALV tree hierarchy
+*----------------------------------------------------------------------*
+FORM f_create_hierarchy.
+  DATA: ls_tree_output          TYPE gty_tree_output,
+        ls_tr_detail            TYPE gty_tr_detail,
+        lv_tr_node_key          TYPE lvc_nkey,
+        lv_tr_num               TYPE lvc_value,
+        ls_systems              TYPE ctslg_system,
+        lv_system_node_key      TYPE lvc_nkey,
+        lv_systemid             TYPE lvc_value,
+        lv_system_item_node_key TYPE lvc_nkey,
+        lv_item_desc            TYPE lvc_value,
+        lt_tree_output          TYPE  gtt_tree_output.
+  DATA: ls_node_layout TYPE lvc_s_layn.
+  LOOP AT gt_tr_detail INTO ls_tr_detail.
+*Build TR node
+*Determine text color with return code
+    PERFORM f_get_tr_rc_color USING    ls_tr_detail-trkorr
+                              CHANGING ls_node_layout-style.
+    CONCATENATE ls_tr_detail-trkorr '-' ls_tr_detail-trdesc INTO lv_tr_num.
+    PERFORM f_build_tr_node USING    lv_tr_num
+                                     ls_node_layout
+                            CHANGING lv_tr_node_key.
+    CLEAR: ls_node_layout.
+*Build system node
+    LOOP AT ls_tr_detail-systems INTO ls_systems.
+      lv_systemid = ls_systems-systemid.
+*Determine text color with return code
+      PERFORM f_get_syst_rc_color USING    ls_tr_detail-systems
+                                           ls_systems-systemid
+                                  CHANGING ls_node_layout-style.
+      PERFORM f_build_system_node USING    lv_tr_node_key
+                                           lv_systemid
+                                           ls_node_layout
+                                  CHANGING lv_system_node_key.
+      CLEAR: ls_node_layout.
+*Build system step node
+      PERFORM f_build_tree_output USING    ls_tr_detail
+                                           ls_systems
+                                  CHANGING lt_tree_output.
+      LOOP AT lt_tree_output INTO ls_tree_output.
+        lv_item_desc = ls_tree_output-stepdesc.
+*Determine text color with return code
+        PERFORM f_get_rc_color USING    ls_tree_output-import_rc
+                               CHANGING ls_node_layout-style.
+        PERFORM f_build_system_step_node USING    lv_system_node_key
+                                                  lv_item_desc
+                                                  ls_tree_output
+                                                  ls_node_layout
+                                         CHANGING lv_system_item_node_key.
+        CLEAR: ls_node_layout.
+      ENDLOOP.
+
+      CLEAR: lt_tree_output.
+    ENDLOOP.
+    CLEAR: lv_tr_num, lv_systemid, lv_tr_node_key, lv_system_node_key, lv_system_item_node_key.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_TREE_OUTPUT
+*&---------------------------------------------------------------------*
+*& Build output table
+*----------------------------------------------------------------------*
+FORM f_build_tree_output USING    us_tr_detail   TYPE gty_tr_detail
+                                  us_systems     TYPE ctslg_system
+                         CHANGING ch_tree_output TYPE gtt_tree_output.
+  DATA: ls_tree_output TYPE gty_tree_output,
+        ls_steps       TYPE ctslg_step,
+        ls_actions     TYPE ctslg_action.
+  ls_tree_output-trkorr   = us_tr_detail-trkorr.
+  ls_tree_output-trdesc   = us_tr_detail-trdesc.
+  ls_tree_output-systemid = us_systems-systemid.
+  LOOP AT us_systems-steps INTO ls_steps.
+    ls_tree_output-clientid = ls_steps-clientid.
+    PERFORM f_get_step_desc USING ls_steps-stepid CHANGING ls_tree_output-stepdesc.
+    LOOP AT ls_steps-actions INTO ls_actions.
+      ls_tree_output-import_date = ls_actions-date.
+      ls_tree_output-import_time = ls_actions-time.
+      ls_tree_output-import_rc   = ls_actions-rc.
+      APPEND ls_tree_output TO ch_tree_output.
+    ENDLOOP.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_TR_NODE
+*&---------------------------------------------------------------------*
+*& Build TR node
+*----------------------------------------------------------------------*
+FORM f_build_tr_node USING    us_node_text   TYPE lvc_value
+                              us_node_layout TYPE lvc_s_layn
+                     CHANGING ch_node_key    TYPE lvc_nkey.
+
+  go_alv_tree->add_node( EXPORTING i_relat_node_key = ''
+                                   i_relationship   = cl_gui_column_tree=>relat_last_child
+                                   i_node_text      = us_node_text
+                                   is_node_layout   = us_node_layout
+                        IMPORTING  e_new_node_key   = ch_node_key ).
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_SYSTEM_NODE
+*&---------------------------------------------------------------------*
+*& Build system node
+*----------------------------------------------------------------------*
+FORM f_build_system_node USING    us_node_key    TYPE lvc_nkey
+                                  us_node_text   TYPE lvc_value
+                                  us_node_layout TYPE lvc_s_layn
+                         CHANGING ch_node_key    TYPE lvc_nkey.
+
+  go_alv_tree->add_node( EXPORTING  i_relat_node_key = us_node_key
+                                    i_relationship   = cl_gui_column_tree=>relat_last_child
+                                    i_node_text      = us_node_text
+                                    is_node_layout   = us_node_layout
+                          IMPORTING e_new_node_key   = ch_node_key ).
+
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_SYSTEM_STEP_NODE
+*&---------------------------------------------------------------------*
+*& Build system step node
+*----------------------------------------------------------------------*
+FORM f_build_system_step_node USING     us_node_key    TYPE lvc_nkey
+                                        us_node_text   TYPE lvc_value
+                                        us_tree_output TYPE gty_tree_output
+                                        us_node_layout TYPE lvc_s_layn
+                              CHANGING  ch_node_key    TYPE lvc_nkey.
+
+  go_alv_tree->add_node( EXPORTING  i_relat_node_key = us_node_key
+                                    i_relationship   = cl_gui_column_tree=>relat_last_child
+                                    i_node_text      = us_node_text
+                                    is_outtab_line   = us_tree_output
+                                    is_node_layout   = us_node_layout
+                          IMPORTING e_new_node_key   = ch_node_key ).
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_TR_RC_COLOR
+*&---------------------------------------------------------------------*
+*& Determine color TR return code
+*----------------------------------------------------------------------*
+FORM f_get_tr_rc_color USING    us_trkorr TYPE trkorr
+                       CHANGING ch_color  TYPE int4.
+  DATA: ls_tr_detail TYPE gty_tr_detail.
+  READ TABLE gt_tr_detail INTO ls_tr_detail WITH KEY trkorr = us_trkorr.
+  IF sy-subrc = 0.
+    PERFORM f_get_rc_color USING ls_tr_detail-tr_rc CHANGING ch_color.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_SYST_RC_COLOR
+*&---------------------------------------------------------------------*
+*& Determine color for system return code
+*----------------------------------------------------------------------*
+FORM f_get_syst_rc_color USING    us_systems  TYPE ctslg_systems
+                                  us_systemid TYPE trtarsys
+                         CHANGING ch_color    TYPE int4.
+  DATA: ls_system TYPE ctslg_system.
+  READ TABLE us_systems INTO ls_system WITH KEY systemid = us_systemid.
+  IF sy-subrc = 0.
+    PERFORM f_get_rc_color USING    ls_system-rc
+                           CHANGING ch_color.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_RC_COLOR
+*&---------------------------------------------------------------------*
+*& Determine color for return code
+*----------------------------------------------------------------------*
+FORM f_get_rc_color USING    us_rc    TYPE int4
+                    CHANGING ch_color TYPE int4.
+  CASE us_rc.
+    WHEN 0. "Successful
+    WHEN 8. "Error
+      ch_color = cl_gui_column_tree=>style_emphasized_negative.
+    WHEN OTHERS. "Warning
+      ch_color = cl_gui_column_tree=>style_emphasized.
+  ENDCASE.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_BUILD_FIELDCATALOG
+*&---------------------------------------------------------------------*
+*& Build fieldcatalog, ALV display setting
+*----------------------------------------------------------------------*
+FORM f_build_fieldcatalog.
+  DATA: lo_salv_table  TYPE REF TO cl_salv_table,
+        lt_tree_output TYPE STANDARD TABLE OF gty_tree_output.
+  FIELD-SYMBOLS: <lfs_fieldcatalog> TYPE lvc_s_fcat.
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table   = lo_salv_table
+                              CHANGING  t_table        = lt_tree_output  ).
+      gt_fieldcatalog = cl_salv_controller_metadata=>get_lvc_fieldcatalog(
+       r_columns      = lo_salv_table->get_columns( )
+       r_aggregations = lo_salv_table->get_aggregations( ) ).
+    CATCH cx_root.
+      RETURN.
+  ENDTRY.
+  LOOP AT gt_fieldcatalog ASSIGNING <lfs_fieldcatalog>.
+    <lfs_fieldcatalog>-colddictxt = 'L'.
+    <lfs_fieldcatalog>-outputlen  = 15.
+    IF <lfs_fieldcatalog>-fieldname = 'TRKORR' OR
+       <lfs_fieldcatalog>-fieldname = 'TRDESC' OR
+       <lfs_fieldcatalog>-fieldname = 'STEPDESC' OR
+       <lfs_fieldcatalog>-fieldname = 'TRSTATUS'.
+      <lfs_fieldcatalog>-no_out     = 'X'.
+    ENDIF.
+    IF <lfs_fieldcatalog>-fieldname = 'SYSTEMID'.
+      <lfs_fieldcatalog>-scrtext_s = 'Syst. ID'.
+      <lfs_fieldcatalog>-scrtext_m = 'System ID'.
+      <lfs_fieldcatalog>-scrtext_l = 'System ID'.
+      <lfs_fieldcatalog>-seltext   = 'System ID'.
+    ENDIF.
+    IF <lfs_fieldcatalog>-fieldname = 'IMPORT_RC'.
+      <lfs_fieldcatalog>-scrtext_s = 'Import RC'.
+      <lfs_fieldcatalog>-scrtext_m = 'Import RC'.
+      <lfs_fieldcatalog>-scrtext_l = 'Import RC'.
+      <lfs_fieldcatalog>-seltext   = 'Import RC'.
+
+    ENDIF.
+  ENDLOOP.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form F_GET_CURR_TIME
+*&---------------------------------------------------------------------*
+*& Get current time
+*&---------------------------------------------------------------------*
+FORM f_get_curr_time CHANGING ch_date TYPE datum
+                              ch_time TYPE uzeit.
+  DATA: lv_timestamp TYPE timestamp.
+
+  GET TIME STAMP FIELD lv_timestamp.
+  CONVERT TIME STAMP lv_timestamp TIME ZONE sy-zonlo
+  INTO DATE ch_date TIME ch_time.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form F_CONVERT_DATE_TO_EXTERNAL
+*&---------------------------------------------------------------------*
+*& Convert date from yyyymmdd to dd.mm.yyyy
+*&---------------------------------------------------------------------*
+FORM f_convert_date_to_external  USING    us_input  TYPE datum
+                                 CHANGING ch_output TYPE char10.
+  CALL FUNCTION 'CONVERSION_EXIT_PDATE_OUTPUT'
+    EXPORTING
+      input  = us_input
+    IMPORTING
+      output = ch_output.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form F_CONVERT_DATE_TO_EXTERNAL
+*&---------------------------------------------------------------------*
+*& Convert date from yyyymmdd to dd.mm.yyyy
+*&---------------------------------------------------------------------*
+FORM f_convert_time_to_external  USING    us_input  TYPE uzeit
+                                 CHANGING ch_output TYPE char5.
+  ch_output = us_input(2) && ':' && us_input+2(2).
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_STEP_DESC
+*&---------------------------------------------------------------------*
+*& Determine step description
+*----------------------------------------------------------------------*
+FORM f_get_step_desc USING    us_stepid   TYPE ctslg_step-stepid
+                     CHANGING ch_stepdesc TYPE ddtext.
+  CASE us_stepid.
+    WHEN 'A'.    ch_stepdesc = 'ABAP Dictionary Activation'.
+    WHEN 'B'.    ch_stepdesc = 'Inactive import'.
+    WHEN 'C'.    ch_stepdesc = 'SAP HANA Repository Deployment'.
+    WHEN 'D'.    ch_stepdesc = 'Import Application-Defined Objects'.
+    WHEN 'E'.    ch_stepdesc = 'Export'.
+    WHEN 'e'.    ch_stepdesc = 'Pre-Export Methods'.
+    WHEN 'F'.    ch_stepdesc = 'VCS Checkin'.
+    WHEN 'f'.    ch_stepdesc = 'Checks at Operating System Level'.
+    WHEN 'G'.    ch_stepdesc = 'Generation of Programs and Dynpros'.
+    WHEN 'H'.    ch_stepdesc = 'Import ABAP Dictionary Objects'.
+    WHEN 'I'.    ch_stepdesc = 'Import'.
+    WHEN 'K'.    ch_stepdesc = 'R3trans Shadow Import'.
+    WHEN 'L'.    ch_stepdesc = 'Import Request Piece List'.
+    WHEN 'M'.    ch_stepdesc = 'Matchcode and Enqueue Activation'.
+    WHEN 'm'.    ch_stepdesc = 'Create Transport Information File'.
+    WHEN 'O'.    ch_stepdesc = 'Trace SPAM'.
+    WHEN 'P'.    ch_stepdesc = 'Test Import'.
+    WHEN 'p'.    ch_stepdesc = 'Request waiting for QA approval'.
+    WHEN 'q'.    ch_stepdesc = 'QA approval given'.
+    WHEN 'R'.    ch_stepdesc = 'Method Execution'.
+    WHEN 'r'.    ch_stepdesc = 'Copy File Between Transport Groups'.
+    WHEN 'T'.    ch_stepdesc = 'Deployment'.
+    WHEN 't'.    ch_stepdesc = 'Check deploy status'.
+    WHEN 'V'.    ch_stepdesc = 'Check Versions'.
+    WHEN 'v'.    ch_stepdesc = 'Create Versions After Import'.
+    WHEN 'W'.    ch_stepdesc = 'Routing'.
+    WHEN 'w'.    ch_stepdesc = 'Create Versions Before Import'.
+    WHEN 'X'.    ch_stepdesc = 'Export of application-defined objects'.
+    WHEN 'Y'.    ch_stepdesc = 'Transport Again with Merge Request'.
+    WHEN '7'.    ch_stepdesc = 'Execute method (follow-up actions)'.
+    WHEN '>'.    ch_stepdesc = 'Deleted from buffer'.
+    WHEN '<'.    ch_stepdesc = 'Selection for Import'.
+    WHEN '|'.    ch_stepdesc = 'Import not approved'.
+    WHEN ')'.    ch_stepdesc = 'Transferring System'.
+    WHEN '('.    ch_stepdesc = '-> Continue: Other Transport Ggroup'.
+    WHEN ':'.    ch_stepdesc = '-> Other Domain'.
+    WHEN '#'.    ch_stepdesc = 'Change ADO Code Page'.
+    WHEN '!'.    ch_stepdesc = 'Import ended'.
+    WHEN '@'.    ch_stepdesc = 'Not importable locally (Central CTS)'.
+    WHEN OTHERS. ch_stepdesc = 'Unknown Step'.
+  ENDCASE.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_REGISTER_EVENTS
+*&---------------------------------------------------------------------*
+*& Register event for ALV Tree
+*----------------------------------------------------------------------*
+FORM f_register_events.
+*§4. Event registration: tell ALV Tree which events shall be passed
+*    from frontend to backend.
+  DATA: lt_events        TYPE cntl_simple_events,
+        l_event          TYPE cntl_simple_event,
+        l_event_receiver TYPE REF TO lcl_tree_event_receiver.
+
+*§4a. Frontend registration(i):  get already registered tree events.
+*................................................................
+* The following four tree events registers ALV Tree in the constructor
+* method itself.
+*    - cl_gui_column_tree=>eventid_expand_no_children
+* (needed to load data to frontend when a user expands a node)
+*    - cl_gui_column_tree=>eventid_header_context_men_req
+* (needed for header context menu)
+*    - cl_gui_column_tree=>eventid_header_click
+* (allows selection of columns (only when item selection activated))
+*   - cl_gui_column_tree=>eventid_item_keypress
+* (needed for F1-Help (only when item selection activated))
+*
+* Nevertheless you have to provide their IDs again if you register
+* additional events with SET_REGISTERED_EVENTS (see below).
+* To do so, call first method  GET_REGISTERED_EVENTS (this way,
+* all already registered events remain registered, even your own):
+  go_alv_tree->get_registered_events( IMPORTING events = lt_events ).
+
+  l_event-eventid = cl_gui_column_tree=>eventid_node_double_click.
+  APPEND l_event TO lt_events.
+  l_event-eventid = cl_gui_column_tree=>eventid_item_double_click.
+  APPEND l_event TO lt_events.
+*§4c. Frontend registration(iii):provide new event table to alv tree
+  go_alv_tree->set_registered_events( EXPORTING  events                    = lt_events
+                                      EXCEPTIONS cntl_error                = 1
+                                                 cntl_system_error         = 2
+                                                 illegal_event_combination = 3 ).
+  IF sy-subrc <> 0.
+    MESSAGE x208(00) WITH 'ERROR'.                          "#EC NOTEXT
+  ENDIF.
+*--------------------
+*§4d. Register events on backend (ABAP Objects event handling)
+  CREATE OBJECT l_event_receiver.
+  SET HANDLER l_event_receiver->handle_node_double_click FOR go_alv_tree.
+  SET HANDLER l_event_receiver->handle_item_double_click FOR go_alv_tree.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Module  PBO  OUTPUT
+*&---------------------------------------------------------------------*
+*&Process before output
+*----------------------------------------------------------------------*
+MODULE pbo OUTPUT.
+  SET PF-STATUS 'STATUS_0100'.
+  SET TITLEBAR 'TITLE_0100'.
+  IF go_alv_tree IS INITIAL.
+    PERFORM f_init_tree.
+
+    cl_gui_cfw=>flush( EXCEPTIONS cntl_system_error = 1
+                                  cntl_error        = 2 ).
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'POPUP_TO_INFORM'
+        EXPORTING
+          titel = 'Automation Queue failure'(801)
+          txt1  = 'Internal error:'(802)
+          txt2  = 'A method in the automation queue'(803)
+          txt3  = 'caused a failure.'(804).
+    ENDIF.
+  ENDIF.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100
+*&---------------------------------------------------------------------*
+*& User command
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+  IF sy-ucomm = 'BACK'.
+    SET SCREEN 0.
+    LEAVE SCREEN.
+  ENDIF.
+ENDMODULE.
