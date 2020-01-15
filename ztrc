@@ -298,7 +298,7 @@ FORM f_build_top CHANGING ch_list_commentary TYPE slis_t_listheader.
 *Warning TR:
   CLEAR: ls_line, lt_tr_detail.
   lt_tr_detail = gt_tr_detail.
-  DELETE lt_tr_detail WHERE tr_rc = 8 AND
+  DELETE lt_tr_detail WHERE tr_rc = 8 or
                             tr_rc = 0.
   DESCRIBE TABLE lt_tr_detail LINES lv_tr_warn_num.
   ls_line-key = 'Warning TR:'.
